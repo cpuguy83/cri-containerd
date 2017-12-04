@@ -83,7 +83,11 @@ func (c *criContainerdService) RunPodSandbox(ctx context.Context, r *runtime.Run
 	securityContext := config.GetLinux().GetSecurityContext()
 	//Create Network Namespace if it is not in host network
 	hostNet := securityContext.GetNamespaceOptions().GetHostNetwork()
-	if !hostNet {
+
+	netReady := make(chan func() error)
+	if hostNet {
+		close(netReady)
+	} else {
 		// If it is not in host network namespace then create a namespace and set the sandbox
 		// handle. NetNSPath in sandbox metadata and NetNS is non empty only for non host network
 		// namespaces. If the pod is in host network namespace then both are empty and should not
@@ -101,7 +105,7 @@ func (c *criContainerdService) RunPodSandbox(ctx context.Context, r *runtime.Run
 				sandbox.NetNSPath = ""
 			}
 		}()
-		// Setup network for sandbox.
+
 		podNetwork := ocicni.PodNetwork{
 			Name:         config.GetMetadata().GetName(),
 			Namespace:    config.GetMetadata().GetNamespace(),
@@ -109,15 +113,27 @@ func (c *criContainerdService) RunPodSandbox(ctx context.Context, r *runtime.Run
 			NetNS:        sandbox.NetNSPath,
 			PortMappings: toCNIPortMappings(config.GetPortMappings()),
 		}
-		if err = c.netPlugin.SetUpPod(podNetwork); err != nil {
-			return nil, fmt.Errorf("failed to setup network for sandbox %q: %v", id, err)
-		}
-		defer func() {
-			if retErr != nil {
-				// Teardown network if an error is returned.
-				if err := c.netPlugin.TearDownPod(podNetwork); err != nil {
-					glog.Errorf("Failed to destroy network for sandbox %q: %v", id, err)
+
+		go func() {
+			defer close(netReady)
+			// Setup network for sandbox.
+
+			if err = c.netPlugin.SetUpPod(podNetwork); err != nil {
+				netReady <- func() error {
+					return fmt.Errorf("failed to setup network for sandbox %q: %v", id, err)
 				}
+			}
+
+			netReady <- func() error {
+				defer func() {
+					if retErr != nil {
+						// Teardown network if an error is returned.
+						if err := c.netPlugin.TearDownPod(podNetwork); err != nil {
+							glog.Errorf("Failed to destroy network for sandbox %q: %v", id, err)
+						}
+					}
+				}()
+				return nil
 			}
 		}()
 	}
@@ -217,6 +233,12 @@ func (c *criContainerdService) RunPodSandbox(ctx context.Context, r *runtime.Run
 			}
 		}
 	}()
+
+	if netErr := <-netReady; netErr != nil {
+		if e := netErr(); e != nil {
+			return nil, e
+		}
+	}
 
 	if err = task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start sandbox container task %q: %v",
